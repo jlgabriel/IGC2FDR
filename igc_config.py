@@ -59,8 +59,8 @@ class Config:
             if 'timezoneigc' in defaults:
                 self.timezoneIGC = secondsFromString(defaults['timezoneigc'])
 
-        if cliArgs.outputFolder:
-            self.outPath = cliArgs.outputFolder
+        if cliArgs.output:
+            self.outPath = cliArgs.output
         elif 'outpath' in defaults:
             self.outPath = defaults['outpath']
 

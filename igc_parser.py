@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 IGC file parser module for IGC to FDR converter
+
+This module handles parsing of IGC files including header metadata extraction,
+position data processing, and attitude estimation based on trajectory.
 """
 
 import math
+import logging
 from datetime import date, datetime, timedelta
-from typing import TextIO
+from typing import TextIO, Dict, List, Tuple, Optional, Any
 
 from igc_model import FileType, FdrFlight, FdrTrackPoint, FlightMeta
 from igc_utils import calculateDistance, calculateHeading, wrapHeading, wrapAttitude
@@ -29,382 +33,588 @@ from igc_constants import (
     KNOTS_PER_MPS,
     SECONDS_PER_MINUTE,
     EARTH_GRAVITY,
-    RADIANS_PER_DEGREE
+    RADIANS_PER_DEGREE,
+    DEGREES_IN_CIRCLE
 )
 
-
-def strip_prefixes(text, prefixes):
-    """Remove common prefixes from a text string"""
-    if not text:
-        return text
-
-    for prefix in prefixes:
-        if text.startswith(prefix):
-            return text[len(prefix):]
-
-    return text
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
-def getFiletype(file: TextIO) -> FileType:
-    """Determine the file type based on content"""
-    filetype = FileType.UNKNOWN
-    startingPos = file.tell()
+class IgcFileDetector:
+    """
+    Detects the file type of a given file based on its content.
+    Specialized in recognizing IGC, CSV, KML and GPX formats.
+    """
+    
+    @staticmethod
+    def detect_filetype(file: TextIO) -> FileType:
+        """Determine the file type based on content"""
+        filetype = FileType.UNKNOWN
+        starting_pos = file.tell()
 
-    # Try to detect IGC first (they typically start with 'A' followed by manufacturer code)
-    line = file.readline()
-    if isinstance(line, bytes):
-        line = line.decode('utf-8', errors='ignore')
-    if line.startswith('A'):
-        # Check if the second line is a header record
-        line2 = file.readline()
-        if isinstance(line2, bytes):
-            line2 = line2.decode('utf-8', errors='ignore')
-        if line2.startswith('H'):
-            filetype = FileType.IGC
-    # Reset position to check other formats if not IGC
-    file.seek(startingPos)
-
-    if filetype == FileType.UNKNOWN:
+        # Try to detect IGC first (they typically start with 'A' followed by manufacturer code)
         line = file.readline()
         if isinstance(line, bytes):
             line = line.decode('utf-8', errors='ignore')
-        if not line.startswith('<?xml'):
-            filetype = FileType.CSV
-        else:
+        if line.startswith('A'):
+            # Check if the second line is a header record
+            line2 = file.readline()
+            if isinstance(line2, bytes):
+                line2 = line2.decode('utf-8', errors='ignore')
+            if line2.startswith('H'):
+                filetype = FileType.IGC
+        # Reset position to check other formats if not IGC
+        file.seek(starting_pos)
+
+        if filetype == FileType.UNKNOWN:
             line = file.readline()
             if isinstance(line, bytes):
                 line = line.decode('utf-8', errors='ignore')
-            if line.startswith('<kml'):
-                filetype = FileType.KML
-            elif line.startswith('<gpx'):
-                filetype = FileType.GPX
+            if not line.startswith('<?xml'):
+                filetype = FileType.CSV
+            else:
+                line = file.readline()
+                if isinstance(line, bytes):
+                    line = line.decode('utf-8', errors='ignore')
+                if line.startswith('<kml'):
+                    filetype = FileType.KML
+                elif line.startswith('<gpx'):
+                    filetype = FileType.GPX
 
-    file.seek(startingPos)
-    return filetype
-
-
-def apply_attitude_smoothing(fdrPoint, prev_point, tailConfig):
-    """Apply smoothing and scaling to attitude values"""
-    # Get smoothing factors from config or use defaults
-    roll_factor = DEFAULT_ROLL_FACTOR
-    pitch_factor = DEFAULT_PITCH_FACTOR
-
-    if 'rollfactor' in tailConfig:
-        try:
-            roll_factor = float(tailConfig['rollfactor'])
-        except ValueError:
-            pass
-
-    if 'pitchfactor' in tailConfig:
-        try:
-            pitch_factor = float(tailConfig['pitchfactor'])
-        except ValueError:
-            pass
-
-    # Scale the values to be less extreme
-    fdrPoint.ROLL = fdrPoint.ROLL * roll_factor
-    fdrPoint.PITCH = fdrPoint.PITCH * pitch_factor
-
-    # Apply simple smoothing if we have a previous point
-    if prev_point:
-        smoothing = DEFAULT_SMOOTHING_FACTOR  # Smoothing factor (0=no smoothing, 1=no change)
-        fdrPoint.HEADING = prev_point.HEADING * smoothing + fdrPoint.HEADING * (1 - smoothing)
-        fdrPoint.PITCH = prev_point.PITCH * smoothing + fdrPoint.PITCH * (1 - smoothing)
-        fdrPoint.ROLL = prev_point.ROLL * smoothing + fdrPoint.ROLL * (1 - smoothing)
-
-    # Apply attitude correction from config
-    fdrPoint.HEADING = round(wrapHeading(fdrPoint.HEADING + tailConfig['headingtrim']), 3)
-    fdrPoint.PITCH = round(wrapAttitude(fdrPoint.PITCH + tailConfig['pitchtrim']), 3)
-    fdrPoint.ROLL = round(wrapAttitude(fdrPoint.ROLL + tailConfig['rolltrim']), 3)
+        file.seek(starting_pos)
+        return filetype
 
 
-def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
+class IgcHeaderParser:
     """
-    Parse an IGC file into an FdrFlight object.
-
-    IGC files contain flight tracks for gliders with position, altitude and time data.
-    They do not directly provide attitude (pitch, roll) which must be estimated.
+    Parses header records from IGC files and extracts metadata.
+    Handles different header types and formats.
     """
-    flightMeta = FlightMeta()
-    fdrFlight = FdrFlight()
+    
+    def __init__(self, prefixes_to_strip: List[str] = None):
+        """
+        Initialize with optional list of prefixes to strip from header values
+        """
+        self.prefixes_to_strip = prefixes_to_strip or DEFAULT_STRIP_PREFIXES
+    
+    @staticmethod
+    def strip_prefixes(text: str, prefixes: List[str]) -> str:
+        """Remove common prefixes from a text string"""
+        if not text:
+            return text
 
-    # Set default timezone for IGC (typically UTC)
-    fdrFlight.timezone = config.timezoneIGC if config.timezoneIGC is not None else config.timezone
+        for prefix in prefixes:
+            if text.startswith(prefix):
+                return text[len(prefix):]
 
-    # Variables to store flight date and previous points for calculations
-    flight_date = None
-    prev_point = None
-    prev_time = None
-    total_distance = 0.0
+        return text
+    
+    def parse_header_line(self, line: str, flight_meta: FlightMeta, flight_date: Optional[date] = None) -> Tuple[FlightMeta, Optional[date]]:
+        """
+        Parse a single header line and update flight metadata
+        Returns updated FlightMeta and flight_date
+        """
+        if len(line) < 5 or line[0] != 'H':  # Ensure we have enough characters
+            return flight_meta, flight_date
+            
+        header_type = line[1:5]
 
-    # Read all lines from the file
-    lines = trackFile.readlines()
-
-    # Get prefix stripping list from config if available
-    prefixes_to_strip = DEFAULT_STRIP_PREFIXES  # Default prefixes to strip from constants
-    try:
-        # Try to get aircraft-specific prefixes to strip
-        aircraft_section = config.acftByTail("DEFAULT")  # Use DEFAULT as fallback
-        if aircraft_section and aircraft_section in config.file:
-            aircraft_config = config.file[aircraft_section]
-            if 'stripprefixes' in aircraft_config:
-                prefixes_to_strip = [p.strip() for p in aircraft_config['stripprefixes'].split(',')]
-    except Exception:
-        pass  # Ignore if there's an error getting prefixes
-
-    # First pass: extract header information
-    for line in lines:
-        if isinstance(line, bytes):
-            line = line.decode('utf-8', errors='ignore')
-        line = line.strip()
-        if not line:
-            continue
-
-        record_type = line[0]
-
-        # Process header records (H)
-        if record_type == 'H':
-            if len(line) < 5:  # Ensure we have enough characters
-                continue
-
-            header_type = line[1:5]
-
-            if header_type == IGC_HEADER_PILOT and len(line) > 5:  # Pilot
-                pilot_value = line[5:].strip()
-                flightMeta.Pilot = strip_prefixes(pilot_value, prefixes_to_strip)
-            elif header_type == IGC_HEADER_GLIDER_TYPE and len(line) > 5:  # Glider type
-                type_value = line[5:].strip()
-                flightMeta.DeviceModel = strip_prefixes(type_value, prefixes_to_strip)
-            elif header_type == IGC_HEADER_GLIDER_ID and len(line) > 5:  # Glider ID/Registration
-                id_value = line[5:].strip()
-                flightMeta.TailNumber = strip_prefixes(id_value, prefixes_to_strip)
-                fdrFlight.TAIL = flightMeta.TailNumber or DEFAULT_UNKNOWN_TEXT
-            elif header_type == IGC_HEADER_GPS and len(line) > 5:  # GPS source
-                flightMeta.GPSSource = f"IGC Flight Logger (DOP={line[5:].strip()})"
-            elif header_type == IGC_HEADER_SITE and len(line) > 5:  # Site/Takeoff
-                flightMeta.DerivedOrigin = line[5:].strip()
-            elif header_type == IGC_HEADER_DATE and len(line) > 11:  # Date (DDMMYY)
-                try:
-                    day = int(line[5:7])
-                    month = int(line[7:9])
-                    year = 2000 + int(line[9:11])  # Assuming 2000+
-                    flight_date = date(year, month, day)
-                    fdrFlight.DATE = flight_date
-                except (ValueError, IndexError):
-                    # If date parsing fails, use current date
-                    flight_date = datetime.today().date()
-                    fdrFlight.DATE = flight_date
-
-        # If we found a B record, stop processing headers
-        if record_type == IGC_RECORD_POSITION:
-            break
-
-    # Initialize IGC-specific metadata
-    flightMeta.InitialAttitudeSource = "Estimated from IGC trajectory"
-    flightMeta.ImportedFrom = "IGC Flight Logger"
-
-    # Second pass: process B records (position fixes)
-    for line in lines:
-        if isinstance(line, bytes):
-            line = line.decode('utf-8', errors='ignore')
-        line = line.strip()
-        if not line or len(line) < 35:  # B records are typically 35+ chars
-            continue
-
-        if line[0] == IGC_RECORD_POSITION:
+        if header_type == IGC_HEADER_PILOT and len(line) > 5:  # Pilot
+            pilot_value = line[5:].strip()
+            flight_meta.Pilot = self.strip_prefixes(pilot_value, self.prefixes_to_strip)
+        
+        elif header_type == IGC_HEADER_GLIDER_TYPE and len(line) > 5:  # Glider type
+            type_value = line[5:].strip()
+            flight_meta.DeviceModel = self.strip_prefixes(type_value, self.prefixes_to_strip)
+        
+        elif header_type == IGC_HEADER_GLIDER_ID and len(line) > 5:  # Glider ID/Registration
+            id_value = line[5:].strip()
+            flight_meta.TailNumber = self.strip_prefixes(id_value, self.prefixes_to_strip)
+        
+        elif header_type == IGC_HEADER_GPS and len(line) > 5:  # GPS source
+            flight_meta.GPSSource = f"IGC Flight Logger (DOP={line[5:].strip()})"
+        
+        elif header_type == IGC_HEADER_SITE and len(line) > 5:  # Site/Takeoff
+            flight_meta.DerivedOrigin = line[5:].strip()
+        
+        elif header_type == IGC_HEADER_DATE and len(line) > 11:  # Date (DDMMYY)
             try:
-                # Time (HHMMSS)
-                hour = int(line[1:3])
-                minute = int(line[3:5])
-                second = int(line[5:7])
+                day = int(line[5:7])
+                month = int(line[7:9])
+                year = 2000 + int(line[9:11])  # Assuming 2000+
+                flight_date = date(year, month, day)
+            except (ValueError, IndexError):
+                # If date parsing fails, use current date
+                flight_date = datetime.today().date()
+                logger.warning("Invalid date format in IGC header, using current date")
+        
+        return flight_meta, flight_date
 
-                # Create datetime object
-                if flight_date:
-                    point_time = datetime.combine(flight_date, datetime.min.time())
-                    point_time = point_time.replace(hour=hour, minute=minute, second=second)
-                else:
-                    # If we don't have a date, use today
-                    point_time = datetime.now().replace(hour=hour, minute=minute, second=second)
 
-                # Latitude (DDMM.mmmN/S format: degrees, minutes, north/south)
-                lat_deg = int(line[7:9])
-                lat_min = int(line[9:11])
-                lat_frac = int(line[11:14]) / 1000
-                lat_dir = line[14]
+class IgcPositionParser:
+    """
+    Parses position records (B records) from IGC files.
+    Extracts time, coordinates, and altitude data.
+    """
+    
+    @staticmethod
+    def parse_time(line: str, flight_date: Optional[date]) -> datetime:
+        """Extract time from a B record"""
+        hour = int(line[1:3])
+        minute = int(line[3:5])
+        second = int(line[5:7])
 
-                latitude = lat_deg + (lat_min + lat_frac) / 60.0
-                if lat_dir == 'S':
-                    latitude = -latitude
+        if flight_date:
+            point_time = datetime.combine(flight_date, datetime.min.time())
+            point_time = point_time.replace(hour=hour, minute=minute, second=second)
+        else:
+            # If we don't have a date, use today
+            point_time = datetime.now().replace(hour=hour, minute=minute, second=second)
+            
+        return point_time
+    
+    @staticmethod
+    def parse_latitude(line: str) -> float:
+        """Extract latitude from a B record"""
+        lat_deg = int(line[7:9])
+        lat_min = int(line[9:11])
+        lat_frac = int(line[11:14]) / 1000
+        lat_dir = line[14]
 
-                # Longitude (DDDMM.mmmE/W format: degrees, minutes, east/west)
-                lon_deg = int(line[15:18])
-                lon_min = int(line[18:20])
-                lon_frac = int(line[20:23]) / 1000
-                lon_dir = line[23]
+        latitude = lat_deg + (lat_min + lat_frac) / 60.0
+        if lat_dir == 'S':
+            latitude = -latitude
+            
+        return latitude
+    
+    @staticmethod
+    def parse_longitude(line: str) -> float:
+        """Extract longitude from a B record"""
+        lon_deg = int(line[15:18])
+        lon_min = int(line[18:20])
+        lon_frac = int(line[20:23]) / 1000
+        lon_dir = line[23]
 
-                longitude = lon_deg + (lon_min + lon_frac) / 60.0
-                if lon_dir == 'W':
-                    longitude = -longitude
-
-                # Altitude - using the corrected method for IGC format
-                # Find 'A' which indicates the altitude section in IGC format
-                a_pos = line.find(IGC_ALTITUDE_MARKER, 23)
-                if a_pos > 0:
-                    # Extract altitude values based on 'A' position
-                    alt_pressure = int(line[a_pos + 1:a_pos + 6])
-                    # Check if GPS altitude is available after pressure altitude
-                    if len(line) >= a_pos + 11:
-                        try:
-                            alt_gps = int(line[a_pos + 6:a_pos + 11])
-                        except ValueError:
-                            alt_gps = alt_pressure  # Use pressure altitude if GPS altitude is invalid
-                    else:
-                        alt_gps = alt_pressure
-                else:
-                    # Fallback to fixed positions if 'A' is not found
+        longitude = lon_deg + (lon_min + lon_frac) / 60.0
+        if lon_dir == 'W':
+            longitude = -longitude
+            
+        return longitude
+    
+    @staticmethod
+    def parse_altitude(line: str) -> Tuple[int, int]:
+        """
+        Extract pressure and GPS altitude from a B record
+        Returns tuple of (pressure_altitude, gps_altitude) in meters
+        """
+        # Find 'A' which indicates the altitude section in IGC format
+        a_pos = line.find(IGC_ALTITUDE_MARKER, 23)
+        if a_pos > 0:
+            # Extract altitude values based on 'A' position
+            alt_pressure = int(line[a_pos + 1:a_pos + 6])
+            # Check if GPS altitude is available after pressure altitude
+            if len(line) >= a_pos + 11:
+                try:
+                    alt_gps = int(line[a_pos + 6:a_pos + 11])
+                except ValueError:
+                    alt_gps = alt_pressure  # Use pressure altitude if GPS altitude is invalid
+            else:
+                alt_gps = alt_pressure
+        else:
+            # Fallback to fixed positions if 'A' is not found
+            try:
+                alt_pressure = int(line[25:30])
+                alt_gps = alt_pressure
+                if len(line) >= 36:
                     try:
-                        alt_pressure = int(line[25:30])
-                        alt_gps = alt_pressure
-                        if len(line) >= 36:
-                            try:
-                                alt_gps = int(line[30:35])
-                            except ValueError:
-                                pass  # Use pressure altitude if GPS altitude is invalid
+                        alt_gps = int(line[30:35])
                     except ValueError:
-                        print(f"Warning: Could not parse altitude from line: {line}")
-                        alt_pressure = 0
-                        alt_gps = 0
+                        pass  # Use pressure altitude if GPS altitude is invalid
+            except ValueError:
+                logger.warning(f"Could not parse altitude from line: {line}")
+                alt_pressure = 0
+                alt_gps = 0
+                
+        return alt_pressure, alt_gps
+    
+    def parse_position_record(self, line: str, flight_date: Optional[date], timezone_offset: int = 0) -> FdrTrackPoint:
+        """
+        Parse a complete B record and return a FdrTrackPoint
+        """
+        # Create a new track point
+        point = FdrTrackPoint()
+        
+        # Parse time
+        point.TIME = self.parse_time(line, flight_date) + timedelta(seconds=timezone_offset)
+        
+        # Parse coordinates
+        point.LAT = round(self.parse_latitude(line), 9)
+        point.LONG = round(self.parse_longitude(line), 9)
+        
+        # Parse altitude
+        _, alt_gps = self.parse_altitude(line)
+        
+        # Convert meters to feet for X-Plane
+        point.ALTMSL = round(alt_gps * FEET_PER_METER, 4)
+        
+        # Initialize attitude values
+        point.HEADING = 0
+        point.PITCH = 0
+        point.ROLL = 0
+        
+        return point
 
-                # Create a new track point
-                fdrPoint = FdrTrackPoint()
-                fdrPoint.TIME = point_time + timedelta(seconds=fdrFlight.timezone)
-                fdrPoint.LAT = round(latitude, 9)
-                fdrPoint.LONG = round(longitude, 9)
 
-                # Use GPS altitude if available, otherwise pressure altitude
-                # Convert meters to feet for X-Plane
-                fdrPoint.ALTMSL = round(alt_gps * FEET_PER_METER, 4)
+class AttitudeCalculator:
+    """
+    Calculates aircraft attitude (heading, pitch, roll) based on position data.
+    Applies smoothing and calibration to the values.
+    """
+    
+    @staticmethod
+    def calculate_derived_values(current_point: FdrTrackPoint, 
+                                 prev_point: FdrTrackPoint, 
+                                 time_diff: float) -> Dict[str, float]:
+        """
+        Calculate derived values such as ground speed, heading, and vertical speed
+        Returns a dictionary of calculated values
+        """
+        derived_values = {
+            'Speed': 0,
+            'Course': 0,
+            'VerticalSpeed': 0,
+            'Pitch': 0,
+            'Bank': 0
+        }
+        
+        if time_diff <= 0:
+            return derived_values
+            
+        # Calculate distance between points using haversine formula
+        dist = calculateDistance(
+            prev_point.LAT, prev_point.LONG, 
+            current_point.LAT, current_point.LONG
+        )
 
-                # Default values for heading, pitch, and roll
-                fdrPoint.HEADING = 0
-                fdrPoint.PITCH = 0
-                fdrPoint.ROLL = 0
+        # Calculate ground speed in knots
+        speed_kts = (dist / time_diff) * KNOTS_PER_MPS  # m/s to knots
+        derived_values['Speed'] = round(speed_kts, 2)
 
-                # Store variables for DREF calculations
-                trackData = {
-                    'Timestamp': fdrPoint.TIME.timestamp(),
-                    'Latitude': fdrPoint.LAT,
-                    'Longitude': fdrPoint.LONG,
-                    'Altitude': fdrPoint.ALTMSL,
+        # Calculate heading based on change in position
+        heading = calculateHeading(
+            prev_point.LAT, prev_point.LONG, 
+            current_point.LAT, current_point.LONG
+        )
+        current_point.HEADING = round(heading, 3)
+        derived_values['Course'] = heading
+
+        # Calculate vertical speed (feet per minute)
+        alt_change = current_point.ALTMSL - prev_point.ALTMSL
+        vert_speed = (alt_change / time_diff) * SECONDS_PER_MINUTE  # feet per minute
+        derived_values['VerticalSpeed'] = round(vert_speed, 2)
+
+        # Estimate pitch from vertical speed and ground speed
+        if dist > 0:
+            # Convert distance to feet for consistent units
+            dist_ft = dist * FEET_PER_METER
+            # Simple trigonometry: pitch = arctan(altitude change / distance)
+            pitch_angle = math.degrees(math.atan2(alt_change, dist_ft))
+            current_point.PITCH = round(pitch_angle, 3)
+            derived_values['Pitch'] = pitch_angle
+
+        # Estimate roll from rate of heading change
+        # This is very simplified - real aircraft roll relates to turn rate and airspeed
+        heading_change = abs(current_point.HEADING - prev_point.HEADING)
+        if heading_change > 180:  # Handle wrap-around (e.g. 359 -> 1)
+            heading_change = 360 - heading_change
+
+        # Simple formula to estimate bank angle from turn rate
+        if heading_change > 0:
+            turn_rate = heading_change / time_diff  # degrees per second
+            # Approximation: roll ≈ arctan(v * turn_rate / g)
+            # Where v is speed in m/s, turn_rate in rad/s, g is 9.81 m/s²
+            speed_ms = speed_kts * 0.51444  # knots to m/s
+            roll_angle = math.degrees(math.atan2(
+                speed_ms * turn_rate * RADIANS_PER_DEGREE, 
+                EARTH_GRAVITY
+            ))
+
+            # Determine roll direction (left/right turn)
+            heading_diff = (current_point.HEADING - prev_point.HEADING + 360) % 360
+            if heading_diff > 180:
+                roll_angle = -roll_angle  # Left turn
+
+            current_point.ROLL = round(roll_angle, 3)
+            derived_values['Bank'] = roll_angle
+            
+        return derived_values
+    
+    @staticmethod
+    def apply_smoothing(current_point: FdrTrackPoint, 
+                        prev_point: Optional[FdrTrackPoint], 
+                        tail_config: Dict[str, Any]) -> None:
+        """
+        Apply smoothing and scaling to attitude values.
+        Updates the point in place.
+        """
+        # Get smoothing factors from config or use defaults
+        roll_factor = DEFAULT_ROLL_FACTOR
+        pitch_factor = DEFAULT_PITCH_FACTOR
+
+        if 'rollfactor' in tail_config:
+            try:
+                roll_factor = float(tail_config['rollfactor'])
+            except ValueError:
+                pass
+
+        if 'pitchfactor' in tail_config:
+            try:
+                pitch_factor = float(tail_config['pitchfactor'])
+            except ValueError:
+                pass
+
+        # Scale the values to be less extreme
+        current_point.ROLL = current_point.ROLL * roll_factor
+        current_point.PITCH = current_point.PITCH * pitch_factor
+
+        # Apply simple smoothing if we have a previous point
+        if prev_point:
+            smoothing = DEFAULT_SMOOTHING_FACTOR  # Smoothing factor (0=no smoothing, 1=no change)
+            current_point.HEADING = prev_point.HEADING * smoothing + current_point.HEADING * (1 - smoothing)
+            current_point.PITCH = prev_point.PITCH * smoothing + current_point.PITCH * (1 - smoothing)
+            current_point.ROLL = prev_point.ROLL * smoothing + current_point.ROLL * (1 - smoothing)
+
+        # Apply attitude correction from config
+        current_point.HEADING = round(wrapHeading(current_point.HEADING + tail_config['headingtrim']), 3)
+        current_point.PITCH = round(wrapAttitude(current_point.PITCH + tail_config['pitchtrim']), 3)
+        current_point.ROLL = round(wrapAttitude(current_point.ROLL + tail_config['rolltrim']), 3)
+
+
+class TrackBuilder:
+    """
+    Builds a complete flight track from IGC position records.
+    Handles coordinate transformations, attitude calculations, and metadata.
+    """
+    
+    def __init__(self, config):
+        """Initialize with configuration"""
+        self.config = config
+        self.position_parser = IgcPositionParser()
+        self.attitude_calculator = AttitudeCalculator()
+        
+    def build_track_from_lines(self, 
+                               lines: List[str], 
+                               flight_meta: FlightMeta, 
+                               flight_date: Optional[date], 
+                               timezone_offset: int) -> Tuple[List[FdrTrackPoint], float]:
+        """
+        Process all position records and build a complete track
+        Returns a tuple of (track_points, total_distance)
+        """
+        track_points = []
+        prev_point = None
+        prev_time = None
+        total_distance = 0.0
+        
+        # Process each B record (position fix)
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='ignore')
+            line = line.strip()
+            
+            if not line or len(line) < 35 or line[0] != IGC_RECORD_POSITION:
+                continue
+                
+            try:
+                # Parse position record
+                point = self.position_parser.parse_position_record(
+                    line, flight_date, timezone_offset
+                )
+                
+                # Store data for DREF calculations
+                track_data = {
+                    'Timestamp': point.TIME.timestamp(),
+                    'Latitude': point.LAT,
+                    'Longitude': point.LONG,
+                    'Altitude': point.ALTMSL,
                     'Course': 0,
                     'Pitch': 0,
                     'Bank': 0,
                     'Speed': 0,
                     'VerticalSpeed': 0
                 }
-
+                
                 # Calculate derived values if we have a previous point
                 if prev_point and prev_time:
                     # Time difference in seconds
-                    time_diff = (fdrPoint.TIME - prev_time).total_seconds()
-
+                    time_diff = (point.TIME - prev_time).total_seconds()
+                    
                     if time_diff > 0:
-                        # Calculate distance between points using haversine formula
-                        dist = calculateDistance(prev_point.LAT, prev_point.LONG, fdrPoint.LAT, fdrPoint.LONG)
-
-                        # Calculate ground speed in knots
-                        speed_kts = (dist / time_diff) * KNOTS_PER_MPS  # m/s to knots
-                        trackData['Speed'] = round(speed_kts, 2)
-
-                        # Calculate heading based on change in position
-                        heading = calculateHeading(prev_point.LAT, prev_point.LONG, fdrPoint.LAT, fdrPoint.LONG)
-                        fdrPoint.HEADING = round(heading, 3)
-                        trackData['Course'] = heading
-
-                        # Calculate vertical speed (feet per minute)
-                        alt_change = fdrPoint.ALTMSL - prev_point.ALTMSL
-                        vert_speed = (alt_change / time_diff) * SECONDS_PER_MINUTE  # feet per minute
-                        trackData['VerticalSpeed'] = round(vert_speed, 2)
-
-                        # Estimate pitch from vertical speed and ground speed
-                        if dist > 0:
-                            # Convert distance to feet for consistent units
-                            dist_ft = dist * FEET_PER_METER
-                            # Simple trigonometry: pitch = arctan(altitude change / distance)
-                            pitch_angle = math.degrees(math.atan2(alt_change, dist_ft))
-                            fdrPoint.PITCH = round(pitch_angle, 3)
-                            trackData['Pitch'] = pitch_angle
-
-                        # Estimate roll from rate of heading change
-                        # This is very simplified - real aircraft roll relates to turn rate and airspeed
-                        heading_change = abs(fdrPoint.HEADING - prev_point.HEADING)
-                        if heading_change > 180:  # Handle wrap-around (e.g. 359 -> 1)
-                            heading_change = 360 - heading_change
-
-                        # Simple formula to estimate bank angle from turn rate
-                        if heading_change > 0:
-                            turn_rate = heading_change / time_diff  # degrees per second
-                            # Approximation: roll ≈ arctan(v * turn_rate / g)
-                            # Where v is speed in m/s, turn_rate in rad/s, g is 9.81 m/s²
-                            speed_ms = speed_kts * 0.51444  # knots to m/s
-                            roll_angle = math.degrees(math.atan2(
-                                speed_ms * turn_rate * RADIANS_PER_DEGREE, 
-                                EARTH_GRAVITY))
-
-                            # Determine roll direction (left/right turn)
-                            heading_diff = (fdrPoint.HEADING - prev_point.HEADING + 360) % 360
-                            if heading_diff > 180:
-                                roll_angle = -roll_angle  # Left turn
-
-                            fdrPoint.ROLL = round(roll_angle, 3)
-                            trackData['Bank'] = roll_angle
-
+                        # Calculate speed, heading, pitch, roll, etc.
+                        derived_values = self.attitude_calculator.calculate_derived_values(
+                            point, prev_point, time_diff
+                        )
+                        
+                        # Update track data with calculated values
+                        track_data.update(derived_values)
+                
                 # Apply smoothing and attitude corrections
-                tailConfig = config.tail(fdrFlight.TAIL)
-                apply_attitude_smoothing(fdrPoint, prev_point, tailConfig)
-
+                tail_config = self.config.tail(flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT)
+                self.attitude_calculator.apply_smoothing(point, prev_point, tail_config)
+                
                 # Evaluate DREFs for this point
-                drefSources, _ = config.drefsByTail(fdrFlight.TAIL)
-                for name in drefSources:
+                dref_sources, _ = self.config.drefsByTail(flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT)
+                for name in dref_sources:
                     try:
-                        value = drefSources[name]
-                        meta = vars(flightMeta)
-                        point = vars(fdrPoint)
-                        fdrPoint.drefs[name] = eval(value.format(**meta, **point, **trackData))
+                        value = dref_sources[name]
+                        meta_vars = vars(flight_meta)
+                        point_vars = vars(point)
+                        point.drefs[name] = eval(value.format(**meta_vars, **point_vars, **track_data))
                     except Exception as e:
-                        print(f"Warning: Failed to evaluate DREF {name}: {e}")
-                        fdrPoint.drefs[name] = 0
-
-                # Add point to the flight track
-                fdrFlight.track.append(fdrPoint)
-
+                        logger.warning(f"Failed to evaluate DREF {name}: {e}")
+                        point.drefs[name] = 0
+                
+                # Add point to the track
+                track_points.append(point)
+                
                 # Update total distance for the flight
                 if prev_point:
-                    dist_miles = calculateDistance(prev_point.LAT, prev_point.LONG,
-                                                   fdrPoint.LAT, fdrPoint.LONG) * 0.000621371  # meters to miles
+                    dist_miles = calculateDistance(
+                        prev_point.LAT, prev_point.LONG,
+                        point.LAT, point.LONG
+                    ) * 0.000621371  # meters to miles
                     total_distance += dist_miles
-
+                
                 # Store current point as previous for next iteration
-                prev_point = fdrPoint
-                prev_time = fdrPoint.TIME
-
+                prev_point = point
+                prev_time = point.TIME
+                
             except (ValueError, IndexError) as e:
-                print(f"Warning: Skipping invalid B record: {line[:35]}... ({e})")
+                logger.warning(f"Skipping invalid B record: {line[:35]}... ({e})")
+                
+        return track_points, total_distance
 
-    # Complete flight metadata if we have track points
-    if fdrFlight.track:
-        flightMeta.StartTime = fdrFlight.track[0].TIME
-        flightMeta.StartLatitude = fdrFlight.track[0].LAT
-        flightMeta.StartLongitude = fdrFlight.track[0].LONG
 
-        flightMeta.EndTime = fdrFlight.track[-1].TIME
-        flightMeta.EndLatitude = fdrFlight.track[-1].LAT
-        flightMeta.EndLongitude = fdrFlight.track[-1].LONG
+class IgcParser:
+    """
+    Main parser class for IGC files. Orchestrates the parsing process
+    using specialized components.
+    """
+    
+    def __init__(self, config):
+        """Initialize with configuration"""
+        self.config = config
+        self.file_detector = IgcFileDetector()
+        self.header_parser = IgcHeaderParser()
+        self.track_builder = TrackBuilder(config)
+        
+    def parse_file(self, track_file: TextIO) -> FdrFlight:
+        """
+        Parse an IGC file into an FdrFlight object.
+        Main entry point for IGC parsing.
+        """
+        flight_meta = FlightMeta()
+        fdr_flight = FdrFlight()
+        
+        # Set default timezone for IGC (typically UTC)
+        fdr_flight.timezone = (
+            self.config.timezoneIGC 
+            if self.config.timezoneIGC is not None 
+            else self.config.timezone
+        )
+        
+        # Variables to store flight date and lines
+        flight_date = None
+        lines = track_file.readlines()
+        
+        # Get prefix stripping list from config if available
+        try:
+            # Try to get aircraft-specific prefixes to strip
+            aircraft_section = self.config.acftByTail("DEFAULT")  # Use DEFAULT as fallback
+            if aircraft_section and aircraft_section in self.config.file:
+                aircraft_config = self.config.file[aircraft_section]
+                if 'stripprefixes' in aircraft_config:
+                    self.header_parser.prefixes_to_strip = [
+                        p.strip() for p in aircraft_config['stripprefixes'].split(',')
+                    ]
+        except Exception:
+            pass  # Ignore if there's an error getting prefixes
+        
+        # First pass: extract header information
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode('utf-8', errors='ignore')
+            line = line.strip()
+            if not line:
+                continue
+                
+            record_type = line[0]
+            
+            # Process header records (H)
+            if record_type == 'H':
+                flight_meta, flight_date = self.header_parser.parse_header_line(
+                    line, flight_meta, flight_date
+                )
+                
+            # If we found a B record, stop processing headers
+            if record_type == IGC_RECORD_POSITION:
+                break
+                
+        # Update flight metadata
+        fdr_flight.TAIL = flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT
+        if flight_date:
+            fdr_flight.DATE = flight_date
+            
+        # Initialize IGC-specific metadata
+        flight_meta.InitialAttitudeSource = "Estimated from IGC trajectory"
+        flight_meta.ImportedFrom = "IGC Flight Logger"
+        
+        # Second pass: process B records (position fixes) and build track
+        track_points, total_distance = self.track_builder.build_track_from_lines(
+            lines, flight_meta, flight_date, fdr_flight.timezone
+        )
+        
+        # Add track points to flight
+        fdr_flight.track = track_points
+        
+        # Complete flight metadata if we have track points
+        if fdr_flight.track:
+            flight_meta.StartTime = fdr_flight.track[0].TIME
+            flight_meta.StartLatitude = fdr_flight.track[0].LAT
+            flight_meta.StartLongitude = fdr_flight.track[0].LONG
 
-        flightMeta.TotalDuration = flightMeta.EndTime - flightMeta.StartTime
-        flightMeta.TotalDistance = total_distance
+            flight_meta.EndTime = fdr_flight.track[-1].TIME
+            flight_meta.EndLatitude = fdr_flight.track[-1].LAT
+            flight_meta.EndLongitude = fdr_flight.track[-1].LONG
 
-    # Generate flight summary
-    fdrFlight.summary = flightSummary(flightMeta)
+            flight_meta.TotalDuration = flight_meta.EndTime - flight_meta.StartTime
+            flight_meta.TotalDistance = total_distance
+            
+        # Generate flight summary
+        fdr_flight.summary = flightSummary(flight_meta)
+        
+        return fdr_flight
 
-    return fdrFlight
+
+# Public functions - maintain backward compatibility
+
+def strip_prefixes(text, prefixes):
+    """Remove common prefixes from a text string"""
+    return IgcHeaderParser.strip_prefixes(text, prefixes)
+
+def getFiletype(file: TextIO) -> FileType:
+    """Determine the file type based on content"""
+    return IgcFileDetector.detect_filetype(file)
+
+def apply_attitude_smoothing(fdr_point, prev_point, tail_config):
+    """Apply smoothing and scaling to attitude values"""
+    AttitudeCalculator.apply_smoothing(fdr_point, prev_point, tail_config)
+
+def parseIgcFile(config, track_file: TextIO) -> FdrFlight:
+    """
+    Parse an IGC file into an FdrFlight object.
+    Main entry point for IGC parsing.
+    """
+    parser = IgcParser(config)
+    return parser.parse_file(track_file)
