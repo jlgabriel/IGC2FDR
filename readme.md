@@ -126,4 +126,4 @@ Contributions are welcome! Areas for improvement include:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the [Licencia MIT](LICENSE) - see the LICENSE file for details.
