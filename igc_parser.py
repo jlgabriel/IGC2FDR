@@ -417,6 +417,9 @@ class TrackBuilder:
         prev_time = None
         total_distance = 0.0
         
+        # Get tail number or use default
+        tail_number = flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT
+        
         # Process each B record (position fix)
         for line in lines:
             if isinstance(line, bytes):
@@ -460,11 +463,15 @@ class TrackBuilder:
                         track_data.update(derived_values)
                 
                 # Apply smoothing and attitude corrections
-                tail_config = self.config.tail(flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT)
-                self.attitude_calculator.apply_smoothing(point, prev_point, tail_config)
+                tail_settings = self.config.get_tail_settings(tail_number)
+                self.attitude_calculator.apply_smoothing(
+                    point, 
+                    prev_point, 
+                    tail_settings.to_dict()
+                )
                 
                 # Evaluate DREFs for this point
-                dref_sources, _ = self.config.drefsByTail(flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT)
+                dref_sources, _ = self.config.drefsByTail(tail_number)
                 for name in dref_sources:
                     try:
                         value = dref_sources[name]
@@ -529,17 +536,7 @@ class IgcParser:
         lines = track_file.readlines()
         
         # Get prefix stripping list from config if available
-        try:
-            # Try to get aircraft-specific prefixes to strip
-            aircraft_section = self.config.acftByTail("DEFAULT")  # Use DEFAULT as fallback
-            if aircraft_section and aircraft_section in self.config.file:
-                aircraft_config = self.config.file[aircraft_section]
-                if 'stripprefixes' in aircraft_config:
-                    self.header_parser.prefixes_to_strip = [
-                        p.strip() for p in aircraft_config['stripprefixes'].split(',')
-                    ]
-        except Exception:
-            pass  # Ignore if there's an error getting prefixes
+        self.header_parser.prefixes_to_strip = self.config.get_strip_prefixes("DEFAULT") or DEFAULT_STRIP_PREFIXES
         
         # First pass: extract header information
         for line in lines:
