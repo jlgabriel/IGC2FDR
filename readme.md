@@ -114,6 +114,7 @@ IGC files contain GPS position and altitude data but lack attitude information (
 - Based on [42fdr](https://github.com/MadReasonable/42fdr) by MadReasonable
 - IGC file format specifications from the [FAI/IGC](https://www.fai.org/igc-documents)
 - FDR format based on X-Plane documentation and examples
+- Code assistance provided by Anthropic Claude 3.7 Sonnet
 
 ## Contributing
 
