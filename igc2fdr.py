@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 IGC to FDR Converter
@@ -12,6 +13,7 @@ Usage:
 import os
 import argparse
 import sys
+import logging
 from pathlib import Path
 
 # Add the current directory to the Python path
@@ -22,6 +24,15 @@ from igc_config import Config
 from igc_parser import parseIgcFile, getFiletype
 from igc_writer import writeOutputFile
 from igc_model import FileType
+from igc_constants import DEFAULT_OUT_PATH
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('igc2fdr')
 
 def main():
     parser = argparse.ArgumentParser(
@@ -33,12 +44,17 @@ def main():
     parser.add_argument('-c', '--config', default=None, help='Path to config file')
     parser.add_argument('-t', '--timezone', default=None, help='An offset to add to all times processed. +/-hh:mm[:ss] or +/-<decimal hours>')
     parser.add_argument('-o', '--outputFolder', default=None, help='Path to write X-Plane compatible FDR v4 output file')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('trackfile', default=None, nargs='+', help='Path to one or more IGC files')
     args = parser.parse_args()
     
+    # Set log level based on verbose flag
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
     config = Config(args)
     for inPath in args.trackfile:
-        print(f"Processing {inPath}...")
+        logger.info(f"Processing {inPath}...")
         try:
             with open(inPath, 'r', encoding='utf-8', errors='ignore') as trackFile:
                 filetype = getFiletype(trackFile)
@@ -47,32 +63,30 @@ def main():
                     fdrFlight = parseIgcFile(config, trackFile)
                     if fdrFlight and len(fdrFlight.track) > 0:
                         outPath = Path(inPath).with_suffix('.fdr')
-                        if config.outPath and config.outPath != '.':
+                        if config.outPath and config.outPath != DEFAULT_OUT_PATH:
                             outPath = Path(config.outPath) / outPath.name
                             
                         with open(outPath, 'w', encoding='utf-8') as fdrFile:
                             writeOutputFile(config, fdrFile, fdrFlight)
-                        print(f"Successfully generated: {outPath}")
+                        logger.info(f"Successfully generated: {outPath}")
                     else:
-                        print(f"Error: No valid track data found in {inPath}")
+                        logger.error(f"No valid track data found in {inPath}")
                 else:
-                    print(f"Error: {inPath} is not a valid IGC file")
+                    logger.error(f"{inPath} is not a valid IGC file")
         except Exception as e:
-            print(f"Error processing {inPath}: {e}")
+            logger.error(f"Error processing {inPath}: {e}", exc_info=args.verbose)
             
-    print("Processing complete.")
+    logger.info("Processing complete.")
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except FileNotFoundError as e:
-        print(f"[Error] File not found: {e.filename}")
+        logger.critical(f"File not found: {e.filename}")
         sys.exit(3)
     except ValueError as e:
-        print(f"[Error] Invalid input: {e}")
+        logger.critical(f"Invalid input: {e}")
         sys.exit(2)
     except Exception as e:
-        print(f"[Unexpected Error] {e}")
-        import traceback
-        traceback.print_exc()
+        logger.critical(f"Unexpected error: {e}", exc_info=True)
         sys.exit(1)

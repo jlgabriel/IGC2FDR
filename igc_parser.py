@@ -10,6 +10,27 @@ from typing import TextIO
 from igc_model import FileType, FdrFlight, FdrTrackPoint, FlightMeta
 from igc_utils import calculateDistance, calculateHeading, wrapHeading, wrapAttitude
 from igc_summary import flightSummary
+from igc_constants import (
+    DEFAULT_ROLL_FACTOR,
+    DEFAULT_PITCH_FACTOR,
+    DEFAULT_SMOOTHING_FACTOR,
+    DEFAULT_STRIP_PREFIXES,
+    DEFAULT_UNKNOWN_TEXT,
+    DEFAULT_NA_TEXT,
+    IGC_HEADER_PILOT,
+    IGC_HEADER_GLIDER_TYPE,
+    IGC_HEADER_GLIDER_ID,
+    IGC_HEADER_GPS,
+    IGC_HEADER_SITE,
+    IGC_HEADER_DATE,
+    IGC_RECORD_POSITION,
+    IGC_ALTITUDE_MARKER,
+    FEET_PER_METER,
+    KNOTS_PER_MPS,
+    SECONDS_PER_MINUTE,
+    EARTH_GRAVITY,
+    RADIANS_PER_DEGREE
+)
 
 
 def strip_prefixes(text, prefixes):
@@ -65,8 +86,8 @@ def getFiletype(file: TextIO) -> FileType:
 def apply_attitude_smoothing(fdrPoint, prev_point, tailConfig):
     """Apply smoothing and scaling to attitude values"""
     # Get smoothing factors from config or use defaults
-    roll_factor = 0.6  # Default roll scaling factor
-    pitch_factor = 0.8  # Default pitch scaling factor
+    roll_factor = DEFAULT_ROLL_FACTOR
+    pitch_factor = DEFAULT_PITCH_FACTOR
 
     if 'rollfactor' in tailConfig:
         try:
@@ -86,7 +107,7 @@ def apply_attitude_smoothing(fdrPoint, prev_point, tailConfig):
 
     # Apply simple smoothing if we have a previous point
     if prev_point:
-        smoothing = 0.3  # Smoothing factor (0=no smoothing, 1=no change)
+        smoothing = DEFAULT_SMOOTHING_FACTOR  # Smoothing factor (0=no smoothing, 1=no change)
         fdrPoint.HEADING = prev_point.HEADING * smoothing + fdrPoint.HEADING * (1 - smoothing)
         fdrPoint.PITCH = prev_point.PITCH * smoothing + fdrPoint.PITCH * (1 - smoothing)
         fdrPoint.ROLL = prev_point.ROLL * smoothing + fdrPoint.ROLL * (1 - smoothing)
@@ -120,7 +141,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
     lines = trackFile.readlines()
 
     # Get prefix stripping list from config if available
-    prefixes_to_strip = ["GLIDERID:", "PILOT:", "GLIDERTYPE:"]  # Default prefixes to strip
+    prefixes_to_strip = DEFAULT_STRIP_PREFIXES  # Default prefixes to strip from constants
     try:
         # Try to get aircraft-specific prefixes to strip
         aircraft_section = config.acftByTail("DEFAULT")  # Use DEFAULT as fallback
@@ -148,21 +169,21 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
 
             header_type = line[1:5]
 
-            if header_type == "FPLT" and len(line) > 5:  # Pilot
+            if header_type == IGC_HEADER_PILOT and len(line) > 5:  # Pilot
                 pilot_value = line[5:].strip()
                 flightMeta.Pilot = strip_prefixes(pilot_value, prefixes_to_strip)
-            elif header_type == "FGTY" and len(line) > 5:  # Glider type
+            elif header_type == IGC_HEADER_GLIDER_TYPE and len(line) > 5:  # Glider type
                 type_value = line[5:].strip()
                 flightMeta.DeviceModel = strip_prefixes(type_value, prefixes_to_strip)
-            elif header_type == "FGID" and len(line) > 5:  # Glider ID/Registration
+            elif header_type == IGC_HEADER_GLIDER_ID and len(line) > 5:  # Glider ID/Registration
                 id_value = line[5:].strip()
                 flightMeta.TailNumber = strip_prefixes(id_value, prefixes_to_strip)
-                fdrFlight.TAIL = flightMeta.TailNumber or "UNKNOWN"
-            elif header_type == "FDOP" and len(line) > 5:  # GPS source
+                fdrFlight.TAIL = flightMeta.TailNumber or DEFAULT_UNKNOWN_TEXT
+            elif header_type == IGC_HEADER_GPS and len(line) > 5:  # GPS source
                 flightMeta.GPSSource = f"IGC Flight Logger (DOP={line[5:].strip()})"
-            elif header_type == "FSIT" and len(line) > 5:  # Site/Takeoff
+            elif header_type == IGC_HEADER_SITE and len(line) > 5:  # Site/Takeoff
                 flightMeta.DerivedOrigin = line[5:].strip()
-            elif header_type == "FDTE" and len(line) > 11:  # Date (DDMMYY)
+            elif header_type == IGC_HEADER_DATE and len(line) > 11:  # Date (DDMMYY)
                 try:
                     day = int(line[5:7])
                     month = int(line[7:9])
@@ -175,7 +196,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
                     fdrFlight.DATE = flight_date
 
         # If we found a B record, stop processing headers
-        if record_type == 'B':
+        if record_type == IGC_RECORD_POSITION:
             break
 
     # Initialize IGC-specific metadata
@@ -190,7 +211,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
         if not line or len(line) < 35:  # B records are typically 35+ chars
             continue
 
-        if line[0] == 'B':
+        if line[0] == IGC_RECORD_POSITION:
             try:
                 # Time (HHMMSS)
                 hour = int(line[1:3])
@@ -227,7 +248,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
 
                 # Altitude - using the corrected method for IGC format
                 # Find 'A' which indicates the altitude section in IGC format
-                a_pos = line.find('A', 23)
+                a_pos = line.find(IGC_ALTITUDE_MARKER, 23)
                 if a_pos > 0:
                     # Extract altitude values based on 'A' position
                     alt_pressure = int(line[a_pos + 1:a_pos + 6])
@@ -262,7 +283,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
 
                 # Use GPS altitude if available, otherwise pressure altitude
                 # Convert meters to feet for X-Plane
-                fdrPoint.ALTMSL = round(alt_gps * 3.28084, 4)
+                fdrPoint.ALTMSL = round(alt_gps * FEET_PER_METER, 4)
 
                 # Default values for heading, pitch, and roll
                 fdrPoint.HEADING = 0
@@ -292,7 +313,7 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
                         dist = calculateDistance(prev_point.LAT, prev_point.LONG, fdrPoint.LAT, fdrPoint.LONG)
 
                         # Calculate ground speed in knots
-                        speed_kts = (dist / time_diff) * 1.94384  # m/s to knots
+                        speed_kts = (dist / time_diff) * KNOTS_PER_MPS  # m/s to knots
                         trackData['Speed'] = round(speed_kts, 2)
 
                         # Calculate heading based on change in position
@@ -302,13 +323,13 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
 
                         # Calculate vertical speed (feet per minute)
                         alt_change = fdrPoint.ALTMSL - prev_point.ALTMSL
-                        vert_speed = (alt_change / time_diff) * 60  # feet per minute
+                        vert_speed = (alt_change / time_diff) * SECONDS_PER_MINUTE  # feet per minute
                         trackData['VerticalSpeed'] = round(vert_speed, 2)
 
                         # Estimate pitch from vertical speed and ground speed
                         if dist > 0:
                             # Convert distance to feet for consistent units
-                            dist_ft = dist * 3.28084
+                            dist_ft = dist * FEET_PER_METER
                             # Simple trigonometry: pitch = arctan(altitude change / distance)
                             pitch_angle = math.degrees(math.atan2(alt_change, dist_ft))
                             fdrPoint.PITCH = round(pitch_angle, 3)
@@ -326,7 +347,9 @@ def parseIgcFile(config, trackFile: TextIO) -> FdrFlight:
                             # Approximation: roll ≈ arctan(v * turn_rate / g)
                             # Where v is speed in m/s, turn_rate in rad/s, g is 9.81 m/s²
                             speed_ms = speed_kts * 0.51444  # knots to m/s
-                            roll_angle = math.degrees(math.atan2(speed_ms * turn_rate * math.pi / 180, 9.81))
+                            roll_angle = math.degrees(math.atan2(
+                                speed_ms * turn_rate * RADIANS_PER_DEGREE, 
+                                EARTH_GRAVITY))
 
                             # Determine roll direction (left/right turn)
                             heading_diff = (fdrPoint.HEADING - prev_point.HEADING + 360) % 360

@@ -8,13 +8,31 @@ from typing import Dict, List, TextIO
 
 from igc_model import FdrFlight
 from igc_utils import toMDY
-
-# Width for FDR output columns
-FdrColumnWidth = 19
+from igc_constants import (
+    FDR_COLUMN_WIDTH,
+    FDR_HEADER,
+    FDR_FOOTER,
+    FDR_SECTION_ACFT,
+    FDR_SECTION_TAIL,
+    FDR_SECTION_DATE,
+    FDR_SECTION_DREF,
+    FDR_SECTION_COMM,
+    FDR_COMMENT_INTRO,
+    FDR_COMMENT_BASED_ON,
+    FDR_COMMENT_TIMEZONE,
+    FDR_COMMENT_FIELDS,
+    FDR_COMMENT_ATTITUDE,
+    FDR_COMMENT_DREFS,
+    FDR_COMMENT_DREFS_TRACK,
+    FDR_COMMENT_TRACK,
+    FDR_COLUMN_HEADERS,
+    TIMESTAMP_FORMAT,
+    TIME_FORMAT_HMS_MS
+)
 
 def writeOutputFile(config, fdrFile: TextIO, fdrFlight: FdrFlight):
     """Write an FDR file from the flight data"""
-    timestamp = datetime.now(timezone.utc).strftime('%Y/%m/%d %H:%M:%SZ')
+    timestamp = datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
     drefSources, drefDefines = config.drefsByTail(fdrFlight.TAIL)
 
     tzOffset = fdrFlight.timezone
@@ -30,70 +48,69 @@ def writeOutputFile(config, fdrFile: TextIO, fdrFlight: FdrFlight):
         tzComment = " and ".join(parts)
         tzOffsetExplanation = f"All timestamps below this line have had {tzComment} {direction} their original values."
     else:
-        tzOffsetExplanation = "All timestamps below this line are in the same timezone as the original file."
+        tzOffsetExplanation = FDR_COMMENT_TIMEZONE
 
     fdrFile.writelines([
-        'A\n4\n',
+        FDR_HEADER,
         '\n',
         fdrComment(f'Generated on [{timestamp}]'),
-        fdrComment(f'This X-Plane compatible FDR file was converted from an IGC track file using igc2fdr.py'),
-        fdrComment('Based on 42fdr.py (https://github.com/MadReasonable/42fdr)'),
+        fdrComment(FDR_COMMENT_INTRO),
+        fdrComment(FDR_COMMENT_BASED_ON),
         '\n',
         fdrComment(tzOffsetExplanation),
         '\n',
         fdrComment(fdrFlight.summary),
         '\n\n',
-        fdrComment("Fields below define general data for this flight."),
-        fdrComment("Only position data is available from IGC files, attitude (heading/pitch/roll) is estimated."),
+        fdrComment(FDR_COMMENT_FIELDS),
+        fdrComment(FDR_COMMENT_ATTITUDE),
         '\n',
-        f'ACFT, {config.aircraftPathForTail(fdrFlight.TAIL)}\n',
-        f'TAIL, {fdrFlight.TAIL}\n',
-        f'DATE, {toMDY(fdrFlight.DATE)}\n',
+        f'{FDR_SECTION_ACFT}, {config.aircraftPathForTail(fdrFlight.TAIL)}\n',
+        f'{FDR_SECTION_TAIL}, {fdrFlight.TAIL}\n',
+        f'{FDR_SECTION_DATE}, {toMDY(fdrFlight.DATE)}\n',
         '\n\n',
-        fdrComment('DREFs below (if any) define additional columns beyond the 7th (Roll)'),
-        fdrComment('in the flight track data that follows.'),
+        fdrComment(FDR_COMMENT_DREFS),
+        fdrComment(FDR_COMMENT_DREFS_TRACK),
         '\n',
         fdrDrefs(drefDefines),
         '\n\n',
-        fdrComment('The remainder of this file consists of GPS track points with estimated attitude.'),
+        fdrComment(FDR_COMMENT_TRACK),
         '\n',
         fdrColNames(drefSources.keys()),
     ])
 
     for point in fdrFlight.track:
-        time    = point.TIME.strftime('%H:%M:%S.%f')
-        long    = str.rjust(str(point.LONG), FdrColumnWidth)
-        lat     = str.rjust(str(point.LAT), FdrColumnWidth)
-        altMSL  = str.rjust(str(point.ALTMSL), FdrColumnWidth)
-        heading = str.rjust(str(point.HEADING), FdrColumnWidth)
-        pitch   = str.rjust(str(point.PITCH), FdrColumnWidth)
-        roll    = str.rjust(str(point.ROLL), FdrColumnWidth)
+        time    = point.TIME.strftime(TIME_FORMAT_HMS_MS)
+        long    = str.rjust(str(point.LONG), FDR_COLUMN_WIDTH)
+        lat     = str.rjust(str(point.LAT), FDR_COLUMN_WIDTH)
+        altMSL  = str.rjust(str(point.ALTMSL), FDR_COLUMN_WIDTH)
+        heading = str.rjust(str(point.HEADING), FDR_COLUMN_WIDTH)
+        pitch   = str.rjust(str(point.PITCH), FDR_COLUMN_WIDTH)
+        roll    = str.rjust(str(point.ROLL), FDR_COLUMN_WIDTH)
         fdrFile.write(f'{time}, {long}, {lat}, {altMSL}, {heading}, {pitch}, {roll}')
 
         drefValues = []
         for dref in drefSources:
-            drefValues.append(str.rjust(str(point.drefs[dref]), FdrColumnWidth))
+            drefValues.append(str.rjust(str(point.drefs[dref]), FDR_COLUMN_WIDTH))
         fdrFile.write(', '+ ', '.join(drefValues) +'\n')
 
 
 def fdrComment(comment: str) -> str:
     """Format a comment for an FDR file"""
-    return 'COMM, '+ '\nCOMM, '.join(comment.splitlines()) +'\n'
+    return f'{FDR_SECTION_COMM}, '+ f'\n{FDR_SECTION_COMM}, '.join(comment.splitlines()) +'\n'
 
 
 def fdrDrefs(drefDefines: List[str]) -> str:
     """Format DREF definitions for an FDR file"""
     if not drefDefines:
         return ""
-    return 'DREF, ' + '\nDREF, '.join(drefDefines) +'\n'
+    return f'{FDR_SECTION_DREF}, ' + f'\n{FDR_SECTION_DREF}, '.join(drefDefines) +'\n'
 
 
 def fdrColNames(drefNames: Dict[str, str]) -> str:
     """Format column names for an FDR file"""
-    names = '''COMM,                        degrees,             degrees,              ft msl,                 deg,                 deg,                 deg
-COMM,                      Longitude,            Latitude,              AltMSL,             Heading,               Pitch,                Roll'''
+    names = FDR_COLUMN_HEADERS
 
     for drefName in drefNames:
-        names += ', '+ str.rjust(drefName, FdrColumnWidth)
+        names += ', '+ str.rjust(drefName, FDR_COLUMN_WIDTH)
 
     return names +'\n'

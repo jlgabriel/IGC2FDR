@@ -10,11 +10,22 @@ from pathlib import Path
 from typing import Dict, List, MutableMapping, Tuple, Union
 
 from igc_utils import secondsFromString, numberOrString
+from igc_constants import (
+    DEFAULT_TIMEZONE,
+    DEFAULT_OUT_PATH,
+    DEFAULT_AIRCRAFT,
+    DEFAULT_HEADING_TRIM,
+    DEFAULT_PITCH_TRIM,
+    DEFAULT_ROLL_TRIM,
+    FDR_COLUMN_WIDTH,
+    CONFIG_SECTION_DEFAULTS,
+    DEFAULT_DREF_GROUND_SPEED
+)
 
 class Config:
-    aircraft: str = 'Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf'
-    outPath: str = '.'
-    timezone: int = 0
+    aircraft: str = DEFAULT_AIRCRAFT
+    outPath: str = DEFAULT_OUT_PATH
+    timezone: int = DEFAULT_TIMEZONE
     timezoneCSV: int = None
     timezoneKML: int = None
     timezoneIGC: int = None
@@ -27,7 +38,7 @@ class Config:
         if configFile:
             self.file.read(configFile)
 
-        defaults = self.file['Defaults'] if 'Defaults' in self.file else {}
+        defaults = self.file[CONFIG_SECTION_DEFAULTS] if CONFIG_SECTION_DEFAULTS in self.file else {}
 
         self.cliAircraft = False
         if cliArgs.aircraft:
@@ -71,11 +82,9 @@ class Config:
     def drefsByTail(self, tailNumber: str) -> Tuple[Dict[str, str], List[str]]:
         sources: Dict[str, str] = {}
         defines: List[str] = []
-        
-        FdrColumnWidth = 19  # Maximum width for DREF column names
 
         def add(instrument: str, value: str, scale: str = '1.0', name: str = None):
-            name = name or instrument.rpartition('/')[2][:FdrColumnWidth]
+            name = name or instrument.rpartition('/')[2][:FDR_COLUMN_WIDTH]
             sources[name] = value
             defines.append(f'{instrument}\t{scale}\t\t// source: {value}')
 
@@ -121,9 +130,9 @@ class Config:
             return instrument, expr, scale, name
 
         # Always include the default ground speed DREF
-        add('sim/cockpit2/gauges/indicators/ground_speed_kt', 'round({Speed}, 4)', '1.0', 'GndSpd')
+        add(DEFAULT_DREF_GROUND_SPEED, 'round({Speed}, 4)', '1.0', 'GndSpd')
 
-        fromSection('Defaults')
+        fromSection(CONFIG_SECTION_DEFAULTS)
         fromSection(self.acftByTail(tailNumber))
         fromSection(tailNumber)
 
@@ -139,11 +148,11 @@ class Config:
                 break
 
         if 'headingtrim' not in tailConfig:
-            tailConfig['headingtrim'] = 0
+            tailConfig['headingtrim'] = DEFAULT_HEADING_TRIM
         if 'pitchtrim' not in tailConfig:
-            tailConfig['pitchtrim'] = 0
+            tailConfig['pitchtrim'] = DEFAULT_PITCH_TRIM
         if 'rolltrim' not in tailConfig:
-            tailConfig['rolltrim'] = 0
+            tailConfig['rolltrim'] = DEFAULT_ROLL_TRIM
 
         return tailConfig
 

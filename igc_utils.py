@@ -8,6 +8,15 @@ import math
 from datetime import datetime, date
 from typing import Union
 
+from igc_constants import (
+    EARTH_RADIUS_METERS,
+    DEGREES_IN_CIRCLE,
+    MAX_ATTITUDE_ANGLE,
+    DATE_FORMAT_MDY,
+    DATE_FORMAT_YMD,
+    TIME_FORMAT_HM
+)
+
 def secondsFromString(timezone: str) -> int:
     """Convert a timezone string to seconds offset"""
     seconds = 0
@@ -41,17 +50,17 @@ def numberOrString(value: str) -> Union[float, str]:
 
 def wrapHeading(degrees: float) -> float:
     """Normalize heading to 0-360 degrees"""
-    return degrees % 360
+    return degrees % DEGREES_IN_CIRCLE
 
 
 def wrapAttitude(degrees: float) -> float:
     """Normalize pitch/roll to -180 to +180 degrees"""
-    mod = 360 if degrees >= 0 else -360
+    mod = DEGREES_IN_CIRCLE if degrees >= 0 else -DEGREES_IN_CIRCLE
     degrees = degrees % mod
-    if degrees > 180:
-        return degrees - 360
-    elif degrees < -180:
-        return degrees + 360
+    if degrees > MAX_ATTITUDE_ANGLE:
+        return degrees - DEGREES_IN_CIRCLE
+    elif degrees < -MAX_ATTITUDE_ANGLE:
+        return degrees + DEGREES_IN_CIRCLE
     else:
         return degrees
 
@@ -72,9 +81,8 @@ def calculateDistance(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
     dlat = lat2_rad - lat1_rad
     a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    r = 6371000  # Radius of earth in meters
     
-    return r * c
+    return EARTH_RADIUS_METERS * c
 
 
 def calculateHeading(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -94,7 +102,7 @@ def calculateHeading(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     heading_rad = math.atan2(y, x)
     
     # Convert to degrees and normalize to 0-360
-    heading_deg = (math.degrees(heading_rad) + 360) % 360
+    heading_deg = (math.degrees(heading_rad) + DEGREES_IN_CIRCLE) % DEGREES_IN_CIRCLE
     
     return heading_deg
 
@@ -116,7 +124,7 @@ def toMDY(time_input: Union[datetime, date, int, str]) -> str:
         time_input = datetime.fromtimestamp(time_input / 1000)
     
     if isinstance(time_input, (datetime, date)):
-        return time_input.strftime('%m/%d/%Y')
+        return time_input.strftime(DATE_FORMAT_MDY)
     
     return str(time_input)  # Fallback
 
@@ -138,7 +146,7 @@ def toYMD(time_input: Union[datetime, date, int, str]) -> str:
         time_input = datetime.fromtimestamp(time_input / 1000)
     
     if isinstance(time_input, (datetime, date)):
-        return time_input.strftime('%Y/%m/%d')
+        return time_input.strftime(DATE_FORMAT_YMD)
     
     return str(time_input)  # Fallback
 
@@ -160,6 +168,6 @@ def toHM(time_input: Union[datetime, date, int, str]) -> str:
         time_input = datetime.fromtimestamp(time_input / 1000)
     
     if isinstance(time_input, (datetime, date)):
-        return time_input.strftime('%H:%M')
+        return time_input.strftime(TIME_FORMAT_HM)
     
     return str(time_input)  # Fallback
