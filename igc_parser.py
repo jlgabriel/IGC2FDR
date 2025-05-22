@@ -394,7 +394,7 @@ class AttitudeCalculator:
 class TrackBuilder:
     """
     Builds a complete flight track from IGC position records.
-    Handles coordinate transformations, attitude calculations, and metadata.
+    GAP-FILLING VERSION: Fills temporal gaps and handles duplicates properly.
     """
     
     def __init__(self, config):
@@ -402,6 +402,69 @@ class TrackBuilder:
         self.config = config
         self.position_parser = IgcPositionParser()
         self.attitude_calculator = AttitudeCalculator()
+    
+    def _select_best_duplicate_point(self, 
+                                     candidates: List[FdrTrackPoint], 
+                                     prev_point: Optional[FdrTrackPoint]) -> FdrTrackPoint:
+        """
+        Select the best point from duplicates with same timestamp.
+        Simple version that just picks the most consistent one.
+        """
+        if len(candidates) == 1:
+            return candidates[0]
+            
+        if not prev_point:
+            return candidates[0]
+        
+        best_point = None
+        best_distance = float('inf')
+        
+        # Pick the point closest to the expected trajectory
+        for candidate in candidates:
+            distance = calculateDistance(
+                prev_point.LAT, prev_point.LONG,
+                candidate.LAT, candidate.LONG
+            )
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_point = candidate
+        
+        return best_point
+    
+    def _fill_time_gap(self, 
+                       start_point: FdrTrackPoint, 
+                       end_point: FdrTrackPoint, 
+                       gap_seconds: int) -> List[FdrTrackPoint]:
+        """
+        Fill a time gap between two points with interpolated points.
+        Creates one point per missing second.
+        """
+        gap_points = []
+        
+        # Don't fill if gap is too large (more than 10 seconds)
+        if gap_seconds > 10:
+            return gap_points
+        
+        # Create points for each missing second
+        for i in range(1, gap_seconds):
+            # Interpolation factor (0.0 to 1.0)
+            factor = i / gap_seconds
+            
+            # Create interpolated point
+            gap_point = FdrTrackPoint()
+            gap_point.LAT = start_point.LAT + (end_point.LAT - start_point.LAT) * factor
+            gap_point.LONG = start_point.LONG + (end_point.LONG - start_point.LONG) * factor
+            gap_point.ALTMSL = start_point.ALTMSL + (end_point.ALTMSL - start_point.ALTMSL) * factor
+            gap_point.TIME = start_point.TIME + timedelta(seconds=i)
+            gap_point.HEADING = 0
+            gap_point.PITCH = 0
+            gap_point.ROLL = 0
+            gap_point.drefs = {}
+            
+            gap_points.append(gap_point)
+        
+        return gap_points
         
     def build_track_from_lines(self, 
                                lines: List[str], 
@@ -409,24 +472,36 @@ class TrackBuilder:
                                flight_date: Optional[date], 
                                timezone_offset: int) -> Tuple[List[FdrTrackPoint], float]:
         """
-        Process all position records and build a complete track
-        Returns a tuple of (track_points, total_distance)
+        Process all position records and build a complete track.
+        GAP-FILLING VERSION: Fills temporal gaps and handles duplicates.
+        
+        Args:
+            lines: Raw IGC file lines
+            flight_meta: Flight metadata
+            flight_date: Date of the flight
+            timezone_offset: Timezone adjustment in seconds
+            
+        Returns:
+            Tuple of (track_points, total_distance_miles)
         """
         track_points = []
         prev_point = None
         prev_time = None
         total_distance = 0.0
         
+        # Dictionary to group points by timestamp (second precision)
+        points_by_second = {}
+        
         # Get tail number or use default
         tail_number = flight_meta.TailNumber or DEFAULT_UNKNOWN_TEXT
         
-        # Process each B record (position fix)
+        # First pass: group points by timestamp (second precision only)
         for line in lines:
             if isinstance(line, bytes):
                 line = line.decode('utf-8', errors='ignore')
             line = line.strip()
             
-            if not line or len(line) < 35 or line[0] != IGC_RECORD_POSITION:
+            if not line or len(line) < 35 or line[0] != 'B':  # IGC position record
                 continue
                 
             try:
@@ -435,6 +510,35 @@ class TrackBuilder:
                     line, flight_date, timezone_offset
                 )
                 
+                # Use timestamp with SECOND precision as key (ignore milliseconds)
+                timestamp_key = point.TIME.strftime("%H%M%S")
+                
+                if timestamp_key not in points_by_second:
+                    points_by_second[timestamp_key] = []
+                    
+                points_by_second[timestamp_key].append(point)
+                
+            except (ValueError, IndexError):
+                # Skip invalid B records silently
+                continue
+        
+        # Second pass: process points and fill gaps
+        sorted_times = sorted(points_by_second.keys())
+        
+        for i, timestamp_key in enumerate(sorted_times):
+            points_at_time = points_by_second[timestamp_key]
+            
+            # Handle duplicate points at same timestamp
+            if len(points_at_time) == 1:
+                # Single point - process normally
+                processed_points = points_at_time
+            else:
+                # Multiple points - select best one (don't interpolate within same second)
+                best_point = self._select_best_duplicate_point(points_at_time, prev_point)
+                processed_points = [best_point]
+            
+            # Process the point(s) for this timestamp
+            for point in processed_points:
                 # Store data for DREF calculations
                 track_data = {
                     'Timestamp': point.TIME.timestamp(),
@@ -453,6 +557,68 @@ class TrackBuilder:
                     # Time difference in seconds
                     time_diff = (point.TIME - prev_time).total_seconds()
                     
+                    # Check for time gaps (missing seconds)
+                    if time_diff > 1.5:  # Gap larger than 1.5 seconds
+                        # Fill the gap with interpolated points
+                        gap_points = self._fill_time_gap(prev_point, point, int(time_diff))
+                        
+                        # Add gap-filling points to track
+                        for gap_point in gap_points:
+                            # Process gap point
+                            gap_track_data = {
+                                'Timestamp': gap_point.TIME.timestamp(),
+                                'Latitude': gap_point.LAT,
+                                'Longitude': gap_point.LONG,
+                                'Altitude': gap_point.ALTMSL,
+                                'Course': 0,
+                                'Pitch': 0,
+                                'Bank': 0,
+                                'Speed': 0,
+                                'VerticalSpeed': 0
+                            }
+                            
+                            # Calculate derived values for gap point
+                            gap_time_diff = (gap_point.TIME - prev_time).total_seconds()
+                            if gap_time_diff > 0:
+                                gap_derived = self.attitude_calculator.calculate_derived_values(
+                                    gap_point, prev_point, gap_time_diff
+                                )
+                                gap_track_data.update(gap_derived)
+                            
+                            # Apply smoothing
+                            tail_settings = self.config.get_tail_settings(tail_number)
+                            self.attitude_calculator.apply_smoothing(
+                                gap_point, prev_point, tail_settings.to_dict()
+                            )
+                            
+                            # Evaluate DREFs
+                            dref_sources, _ = self.config.drefsByTail(tail_number)
+                            for name in dref_sources:
+                                try:
+                                    value = dref_sources[name]
+                                    meta_vars = vars(flight_meta)
+                                    point_vars = vars(gap_point)
+                                    gap_point.drefs[name] = eval(value.format(**meta_vars, **point_vars, **gap_track_data))
+                                except Exception:
+                                    gap_point.drefs[name] = 0
+                            
+                            # Add gap point to track
+                            track_points.append(gap_point)
+                            
+                            # Update distance
+                            if prev_point:
+                                dist_miles = calculateDistance(
+                                    prev_point.LAT, prev_point.LONG,
+                                    gap_point.LAT, gap_point.LONG
+                                ) * 0.000621371
+                                total_distance += dist_miles
+                            
+                            # Update previous point
+                            prev_point = gap_point
+                            prev_time = gap_point.TIME
+                    
+                    # Now process the current point normally
+                    time_diff = (point.TIME - prev_time).total_seconds()
                     if time_diff > 0:
                         # Calculate speed, heading, pitch, roll, etc.
                         derived_values = self.attitude_calculator.calculate_derived_values(
@@ -461,6 +627,13 @@ class TrackBuilder:
                         
                         # Update track data with calculated values
                         track_data.update(derived_values)
+                            
+                    else:
+                        # Very small or zero time difference - use previous values
+                        if prev_point:
+                            point.HEADING = prev_point.HEADING
+                            point.PITCH = prev_point.PITCH
+                            point.ROLL = prev_point.ROLL
                 
                 # Apply smoothing and attitude corrections
                 tail_settings = self.config.get_tail_settings(tail_number)
@@ -478,8 +651,8 @@ class TrackBuilder:
                         meta_vars = vars(flight_meta)
                         point_vars = vars(point)
                         point.drefs[name] = eval(value.format(**meta_vars, **point_vars, **track_data))
-                    except Exception as e:
-                        logger.warning(f"Failed to evaluate DREF {name}: {e}")
+                    except Exception:
+                        # Set to 0 if DREF evaluation fails
                         point.drefs[name] = 0
                 
                 # Add point to the track
@@ -496,10 +669,7 @@ class TrackBuilder:
                 # Store current point as previous for next iteration
                 prev_point = point
                 prev_time = point.TIME
-                
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Skipping invalid B record: {line[:35]}... ({e})")
-                
+        
         return track_points, total_distance
 
 
