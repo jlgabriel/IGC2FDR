@@ -27,6 +27,11 @@ Based on [42fdr](https://github.com/MadReasonable/42fdr) by MadReasonable, which
 ```bash
 python igc2fdr.py [-c config] [-a aircraft] [-t timezone] [-o outputFolder] file.igc [file2.igc ...]
 ```
+Examples:
+
+python igc2fdr.py -c igc2fdr.conf JUGA-2025-05-09.igc
+
+python igc2fdr.py -c igc2fdr.conf JUGA-2025-05-11.igc
 
 ### Options
 
