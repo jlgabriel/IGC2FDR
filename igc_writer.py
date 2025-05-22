@@ -125,13 +125,13 @@ class FdrWriter:
         """Write all track points to the FDR file"""
         for point in track_points:
             # Format standard data fields
-            time    = point.TIME.strftime(TIME_FORMAT_HMS_MS)
-            long    = str.rjust(str(point.LONG), FDR_COLUMN_WIDTH)
-            lat     = str.rjust(str(point.LAT), FDR_COLUMN_WIDTH)
+            time = point.TIME.strftime(TIME_FORMAT_HMS_MS)  # Ensure this format is correct
+            long = str.rjust(str(point.LONG), FDR_COLUMN_WIDTH)
+            lat = str.rjust(str(point.LAT), FDR_COLUMN_WIDTH)
             alt_msl = str.rjust(str(point.ALTMSL), FDR_COLUMN_WIDTH)
             heading = str.rjust(str(point.HEADING), FDR_COLUMN_WIDTH)
-            pitch   = str.rjust(str(point.PITCH), FDR_COLUMN_WIDTH)
-            roll    = str.rjust(str(point.ROLL), FDR_COLUMN_WIDTH)
+            pitch = str.rjust(str(point.PITCH), FDR_COLUMN_WIDTH)
+            roll = str.rjust(str(point.ROLL), FDR_COLUMN_WIDTH)
             
             # Write standard fields
             fdr_file.write(f'{time}, {long}, {lat}, {alt_msl}, {heading}, {pitch}, {roll}')
