@@ -4,6 +4,8 @@ IGC file parser module for IGC to FDR converter
 
 This module handles parsing of IGC files including header metadata extraction,
 position data processing, and attitude estimation based on trajectory.
+
+🔧 FIXED: apply_smoothing() method moved INSIDE AttitudeCalculator class
 """
 
 import math
@@ -280,6 +282,10 @@ class AttitudeCalculator:
         Calculate derived values such as ground speed, heading, and vertical speed
         Returns a dictionary of calculated values
         """
+
+        if prev_point.HEADING == 0.0 or current_point.HEADING == 0.0:
+                print(f"DEBUG: prev_heading={prev_point.HEADING:.1f}deg, time_diff={time_diff:.1f}s")
+
         derived_values = {
             'Speed': 0,
             'Course': 0,
@@ -302,10 +308,23 @@ class AttitudeCalculator:
         derived_values['Speed'] = round(speed_kts, 2)
 
         # Calculate heading based on change in position
+        # FIXED: Pass previous heading as fallback for close/identical GPS points
         heading = calculateHeading(
             prev_point.LAT, prev_point.LONG, 
-            current_point.LAT, current_point.LONG
+            current_point.LAT, current_point.LONG,
+            fallback_heading=prev_point.HEADING  # Use previous heading if points too close
         )
+
+        if (46.80 < current_point.LAT < 46.81 and 12.88 < current_point.LONG < 12.89):
+            print(f"PROBLEM COORDS DEBUG - TIME: {current_point.TIME.strftime('%H:%M:%S')}")
+            print(f"  From: {prev_point.LAT:.6f}, {prev_point.LONG:.6f}")
+            print(f"  To:   {current_point.LAT:.6f}, {current_point.LONG:.6f}")
+            print(f"  Distance: {calculateDistance(prev_point.LAT, prev_point.LONG, current_point.LAT, current_point.LONG):.3f}m")
+            print(f"  Calculated heading: {heading:.3f}deg")
+            print(f"  Previous heading: {prev_point.HEADING:.3f}deg")
+            print(f"  --- END DEBUG ---")
+
+
         current_point.HEADING = round(heading, 3)
         derived_values['Course'] = heading
 
@@ -355,6 +374,7 @@ class AttitudeCalculator:
                         prev_point: Optional[FdrTrackPoint], 
                         tail_config: Dict[str, Any]) -> None:
         """
+        🔧 FIXED: This method is now INSIDE the AttitudeCalculator class
         Apply smoothing and scaling to attitude values.
         Updates the point in place.
         """
@@ -381,20 +401,72 @@ class AttitudeCalculator:
         # Apply simple smoothing if we have a previous point
         if prev_point:
             smoothing = DEFAULT_SMOOTHING_FACTOR  # Smoothing factor (0=no smoothing, 1=no change)
-            current_point.HEADING = prev_point.HEADING * smoothing + current_point.HEADING * (1 - smoothing)
+            
+            # FIX: Handle 360/0 degree wrap-around for heading smoothing
+            current_heading = current_point.HEADING
+            prev_heading = prev_point.HEADING
+            
+            # Calculate the shortest angular distance
+            heading_diff = current_heading - prev_heading
+            if heading_diff > 180:
+                heading_diff -= 360
+            elif heading_diff < -180:
+                heading_diff += 360
+            
+            # Apply smoothing using the corrected difference
+            smoothed_heading = prev_heading + heading_diff * (1 - smoothing)
+            
+            # Normalize to 0-360 range
+            if smoothed_heading < 0:
+                smoothed_heading += 360
+            elif smoothed_heading >= 360:
+                smoothed_heading -= 360
+            
+            current_point.HEADING = smoothed_heading
             current_point.PITCH = prev_point.PITCH * smoothing + current_point.PITCH * (1 - smoothing)
             current_point.ROLL = prev_point.ROLL * smoothing + current_point.ROLL * (1 - smoothing)
 
         # Apply attitude correction from config
+        # Ensure heading is valid before applying trim
+        if current_point.HEADING is None or current_point.HEADING == 0:
+            # If heading is invalid, calculate it from previous point if available
+            if prev_point and hasattr(prev_point, 'HEADING') and prev_point.HEADING != 0:
+                current_point.HEADING = prev_point.HEADING  # Use previous heading as fallback
+            else:
+                current_point.HEADING = 0  # Last resort fallback
+
+        # DEBUG: capture original value before trim
+        original_heading = current_point.HEADING
+
+        # NUEVO DEBUG: Mostrar todo el proceso
+        print(f"TRIM DEBUG: Before trim={current_point.HEADING:.3f}deg, headingtrim={tail_config['headingtrim']}")
+        print(f"TRIM DEBUG: After add: {current_point.HEADING + tail_config['headingtrim']:.3f}deg")
+        print(f"TRIM DEBUG: After wrap: {wrapHeading(current_point.HEADING + tail_config['headingtrim']):.3f}deg")
+
         current_point.HEADING = round(wrapHeading(current_point.HEADING + tail_config['headingtrim']), 3)
-        current_point.PITCH = round(wrapAttitude(current_point.PITCH + tail_config['pitchtrim']), 3)
-        current_point.ROLL = round(wrapAttitude(current_point.ROLL + tail_config['rolltrim']), 3)
+
+        print(f"TRIM DEBUG: Final result: {current_point.HEADING:.3f}deg")
+
+        # DEBUG: detect when heading gets lost
+        if original_heading > 0 and current_point.HEADING == 0:
+            print(f"HEADING LOST: {original_heading:.3f}deg -> 0.0deg (headingtrim={tail_config['headingtrim']})")
+
+        # DETECTAR DISCONTINUIDADES
+        if original_heading > 0:
+            heading_change = abs(current_point.HEADING - original_heading)
+            if heading_change > 180:
+                heading_change = 360 - heading_change
+            if heading_change > 45:  # Cambio mayor a 45deg
+                print(f"TRIM DISCONTINUITY: {original_heading:.3f}deg → {current_point.HEADING:.3f}deg (change={heading_change:.1f}deg, trim={tail_config['headingtrim']})")
+
+                current_point.PITCH = round(wrapAttitude(current_point.PITCH + tail_config['pitchtrim']), 3)
+                current_point.ROLL = round(wrapAttitude(current_point.ROLL + tail_config['rolltrim']), 3)
 
 
 class TrackBuilder:
     """
     Builds a complete flight track from IGC position records.
-    GAP-FILLING VERSION: Fills temporal gaps and handles duplicates properly.
+    FIXED VERSION: Properly interpolates all values including heading, pitch, roll.
     """
     
     def __init__(self, config):
@@ -432,19 +504,58 @@ class TrackBuilder:
         
         return best_point
     
+    def _interpolate_heading(self, start_heading: float, end_heading: float, factor: float) -> float:
+        """
+        Interpolate heading considering wrap-around (0deg/360deg).
+        
+        Args:
+            start_heading: Starting heading in degrees
+            end_heading: Ending heading in degrees  
+            factor: Interpolation factor (0.0 to 1.0)
+            
+        Returns:
+            Interpolated heading in degrees
+        """
+        # Handle wrap-around for heading interpolation
+        diff = end_heading - start_heading
+        
+        # Choose shortest path
+        if diff > 180:
+            diff -= 360
+        elif diff < -180:
+            diff += 360
+        
+        interpolated = start_heading + (diff * factor)
+        
+        # Normalize to 0-360 range
+        while interpolated < 0:
+            interpolated += 360
+        while interpolated >= 360:
+            interpolated -= 360
+            
+        return interpolated
+    
     def _fill_time_gap(self, 
                        start_point: FdrTrackPoint, 
                        end_point: FdrTrackPoint, 
                        gap_seconds: int) -> List[FdrTrackPoint]:
         """
-        Fill a time gap between two points with interpolated points.
-        Creates one point per missing second.
+        Fill a time gap between two points with properly interpolated points.
+        FIXED: Now interpolates ALL values including heading, pitch, roll.
         """
         gap_points = []
         
         # Don't fill if gap is too large (more than 10 seconds)
         if gap_seconds > 10:
             return gap_points
+        
+        # Pre-calculate end_point heading if it doesn't have one yet
+        if not hasattr(end_point, 'HEADING') or end_point.HEADING == 0:
+            # Calculate heading from start to end
+            end_point.HEADING = calculateHeading(
+                start_point.LAT, start_point.LONG,
+                end_point.LAT, end_point.LONG
+            )
         
         # Create points for each missing second
         for i in range(1, gap_seconds):
@@ -453,13 +564,25 @@ class TrackBuilder:
             
             # Create interpolated point
             gap_point = FdrTrackPoint()
+            
+            # Interpolate position
             gap_point.LAT = start_point.LAT + (end_point.LAT - start_point.LAT) * factor
             gap_point.LONG = start_point.LONG + (end_point.LONG - start_point.LONG) * factor
             gap_point.ALTMSL = start_point.ALTMSL + (end_point.ALTMSL - start_point.ALTMSL) * factor
+            
+            # Interpolate time
             gap_point.TIME = start_point.TIME + timedelta(seconds=i)
-            gap_point.HEADING = 0
-            gap_point.PITCH = 0
-            gap_point.ROLL = 0
+            
+            # Interpolate heading (considering wrap-around)
+            gap_point.HEADING = self._interpolate_heading(
+                start_point.HEADING, end_point.HEADING, factor
+            )
+            
+            # Interpolate attitude
+            gap_point.PITCH = start_point.PITCH + (end_point.PITCH - start_point.PITCH) * factor
+            gap_point.ROLL = start_point.ROLL + (end_point.ROLL - start_point.ROLL) * factor
+            
+            # Initialize drefs
             gap_point.drefs = {}
             
             gap_points.append(gap_point)
@@ -473,7 +596,7 @@ class TrackBuilder:
                                timezone_offset: int) -> Tuple[List[FdrTrackPoint], float]:
         """
         Process all position records and build a complete track.
-        GAP-FILLING VERSION: Fills temporal gaps and handles duplicates.
+        FIXED VERSION: Properly handles heading interpolation.
         
         Args:
             lines: Raw IGC file lines
@@ -559,7 +682,15 @@ class TrackBuilder:
                     
                     # Check for time gaps (missing seconds)
                     if time_diff > 1.5:  # Gap larger than 1.5 seconds
-                        # Fill the gap with interpolated points
+                        # IMPORTANT: Calculate attitude for current point BEFORE gap filling
+                        if time_diff > 0:
+                            # Calculate heading, pitch, roll for current point
+                            derived_values = self.attitude_calculator.calculate_derived_values(
+                                point, prev_point, time_diff
+                            )
+                            track_data.update(derived_values)
+                        
+                        # Now fill the gap with properly interpolated points
                         gap_points = self._fill_time_gap(prev_point, point, int(time_diff))
                         
                         # Add gap-filling points to track
@@ -570,10 +701,10 @@ class TrackBuilder:
                                 'Latitude': gap_point.LAT,
                                 'Longitude': gap_point.LONG,
                                 'Altitude': gap_point.ALTMSL,
-                                'Course': 0,
-                                'Pitch': 0,
-                                'Bank': 0,
-                                'Speed': 0,
+                                'Course': gap_point.HEADING,  # Use interpolated heading
+                                'Pitch': gap_point.PITCH,
+                                'Bank': gap_point.ROLL,
+                                'Speed': 0,  # Will be calculated
                                 'VerticalSpeed': 0
                             }
                             
@@ -584,6 +715,12 @@ class TrackBuilder:
                                     gap_point, prev_point, gap_time_diff
                                 )
                                 gap_track_data.update(gap_derived)
+                                
+                                # Override heading with our interpolated value (more accurate)
+                                gap_point.HEADING = self._interpolate_heading(
+                                    prev_point.HEADING, point.HEADING, 
+                                    gap_time_diff / time_diff
+                                )
                             
                             # Apply smoothing
                             tail_settings = self.config.get_tail_settings(tail_number)
@@ -625,6 +762,9 @@ class TrackBuilder:
                             point, prev_point, time_diff
                         )
                         
+                        if point.HEADING == 0.0:
+                            print(f"HEADING=0 after calculation! Line ~{len(track_points)+45}")
+
                         # Update track data with calculated values
                         track_data.update(derived_values)
                             
