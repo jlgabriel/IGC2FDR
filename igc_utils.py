@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Utility functions for IGC to FDR converter
-
-🔧 FIXED: calculateHeading() now handles identical/very close GPS points
 """
 
 import re
@@ -89,8 +87,8 @@ def calculateDistance(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
 
 def calculateHeading(lat1: float, lon1: float, lat2: float, lon2: float, fallback_heading: float = None) -> float:
     """
-    FIXED: Calculate the initial heading between two points in decimal degrees.
-    Now handles identical/very close GPS points properly.
+    Calculate the initial heading between two points in decimal degrees.
+    Handles identical or very close GPS points by using fallback heading.
     
     Args:
         lat1, lon1: Starting point coordinates
@@ -98,18 +96,16 @@ def calculateHeading(lat1: float, lon1: float, lat2: float, lon2: float, fallbac
         fallback_heading: Heading to return if points are too close (default: None)
         
     Returns:
-        heading in degrees (0-360), or fallback_heading if points are identical/very close
+        Heading in degrees (0-360), or fallback_heading if points are identical/very close
     """
     # Check if points are identical or very close (within ~1 meter)
     distance = calculateDistance(lat1, lon1, lat2, lon2)
     if distance < 1.0:  # Less than 1 meter apart
         if fallback_heading is not None:
-            print(f"HEADING FIX: Points too close ({distance:.3f}m), using fallback {fallback_heading:.1f}deg")
             return fallback_heading
         else:
-            # NO devolver 0 - devolver un heading neutro o el último válido
-            print(f"HEADING FIX: Points too close ({distance:.3f}m), no fallback - returning 360deg")
-            return 360.0  # Cambio: en lugar de 0, devolver 360 (equivalente pero evita problemas)
+            # Return 360 instead of 0 to avoid discontinuity issues
+            return 360.0
     
     # Convert to radians
     lat1_rad = math.radians(lat1)
@@ -124,20 +120,17 @@ def calculateHeading(lat1: float, lon1: float, lat2: float, lon2: float, fallbac
     # Handle edge case where both x and y are very small (near zero)
     if abs(x) < 1e-10 and abs(y) < 1e-10:
         if fallback_heading is not None:
-            print(f"HEADING FIX: Calculation resulted in zero vector, using fallback {fallback_heading:.1f}deg")
             return fallback_heading
         else:
-            print(f"HEADING FIX: Calculation resulted in zero vector, no fallback - returning 360deg")
-            return 360.0  # Cambio: en lugar de 0, devolver 360
+            return 360.0  # Avoid returning 0 to prevent discontinuities
     
     heading_rad = math.atan2(y, x)
     
     # Convert to degrees and normalize to 0-360
     heading_deg = (math.degrees(heading_rad) + DEGREES_IN_CIRCLE) % DEGREES_IN_CIRCLE
     
-    # EXTRA FIX: Si el resultado es muy cerca de 0, verificar si debería ser 360
+    # Handle very small headings that might cause issues
     if heading_deg < 0.001:
-        print(f"HEADING FIX: Very small heading ({heading_deg:.6f}deg), converting to 360deg")
         return 360.0
     
     return heading_deg
