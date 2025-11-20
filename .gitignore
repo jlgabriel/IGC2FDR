@@ -1,4 +1,11 @@
+# IDEs
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,4 +14,27 @@ __pycache__/
 *.pyz
 *.pywz
 *.pyzw
+*.egg-info/
+dist/
+build/
 
+# Testing and Coverage
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+.tox/
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# Generated FDR files (optional - uncomment if you don't want to track them)
+# *.fdr
+
+# OS specific
+.DS_Store
+Thumbs.db
